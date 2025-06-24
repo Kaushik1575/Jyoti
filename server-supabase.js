@@ -81,6 +81,20 @@ const verifyAdminToken = async (req, res, next) => {
     }
 };
 
+// Helper function to get IST time in 'YYYY-MM-DD HH:mm:ss' format
+function getISTTimestamp() {
+    const now = new Date();
+    // IST is UTC+5:30, so add 5.5 hours in milliseconds
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const istTime = new Date(now.getTime() + istOffset);
+    return istTime.getFullYear() + '-' +
+        String(istTime.getMonth() + 1).padStart(2, '0') + '-' +
+        String(istTime.getDate()).padStart(2, '0') + ' ' +
+        String(istTime.getHours()).padStart(2, '0') + ':' +
+        String(istTime.getMinutes()).padStart(2, '0') + ':' +
+        String(istTime.getSeconds()).padStart(2, '0');
+}
+
 // Admin: Get all bookings (enriched)
 app.get('/api/admin/bookings', verifyAdminToken, async (req, res) => {
     try {
@@ -300,21 +314,15 @@ app.post('/api/admin/bookings/:id/confirm', verifyAdminToken, async (req, res) =
             return res.status(404).json({ error: 'Booking not found' });
         }
 
-        // Always set confirmation_timestamp to current LOCAL time
-        const now = new Date();
-        const localTimestamp = now.getFullYear() + '-' +
-            String(now.getMonth() + 1).padStart(2, '0') + '-' +
-            String(now.getDate()).padStart(2, '0') + ' ' +
-            String(now.getHours()).padStart(2, '0') + ':' +
-            String(now.getMinutes()).padStart(2, '0') + ':' +
-            String(now.getSeconds()).padStart(2, '0');
-        console.log('Setting confirmation_timestamp to (local):', localTimestamp); // Debug log
+        // Always set confirmation_timestamp to current IST time
+        const istTimestamp = getISTTimestamp();
+        console.log('Setting confirmation_timestamp to (IST):', istTimestamp); // Debug log
         const { data: updatedBooking, error: updateError } = await supabase
             .from('bookings')
             .update({
                 status: 'confirmed',
-                confirmation_timestamp: localTimestamp,
-                updated_at: localTimestamp
+                confirmation_timestamp: istTimestamp,
+                updated_at: istTimestamp
             })
             .eq('id', bookingId)
             .select()
