@@ -216,7 +216,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 const bookingId = e.target.closest('button').dataset.id;
                 if (confirm('Are you sure you want to mark this refund as completed?')) {
                     try {
-                        const response = await fetch(`/api/admin/bookings/${bookingId}/refund/complete`, {
+                        const response = await fetch(`/api/admin/bookings/${bookingId}/refund-complete`, {
                             method: 'POST',
                             headers: {
                                 'Authorization': `Bearer ${token}`,
@@ -230,6 +230,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                         showMessage('success', 'Refund marked as completed successfully');
                         loadBookings(); // Refresh the bookings table
+                        loadDashboardStats(); // Refresh dashboard stats to update pending refund count
                     } catch (error) {
                         showMessage('error', 'Failed to update refund status: ' + error.message);
                     }

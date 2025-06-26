@@ -325,5 +325,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         }
     });
 
+    // After booking is confirmed (example placement)
+    function showBookingConfirmedMessage() {
+        const messageContainer = document.getElementById('bookingMessage') || document.createElement('div');
+        messageContainer.id = 'bookingMessage';
+        messageContainer.innerHTML = 'Booking confirmed! Please check your email for details.<br><small>If you do not see the email, please check your spam or junk folder and mark it as "Not Spam".</small>';
+        messageContainer.style.color = '#155724';
+        messageContainer.style.background = '#d4edda';
+        messageContainer.style.padding = '1em';
+        messageContainer.style.borderRadius = '5px';
+        messageContainer.style.margin = '1em 0';
+        const parent = document.body;
+        if (!document.getElementById('bookingMessage')) parent.prepend(messageContainer);
+    }
+
     fetchUserBookings();
 }); 

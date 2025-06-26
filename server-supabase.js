@@ -5,6 +5,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const SupabaseDB = require('./models/supabaseDB');
 const supabase = require('./config/supabase');
+const { sendBookingConfirmationEmail, sendPasswordResetOTP, generateOTP } = require('./config/emailService');
 
 const app = express();
 const PORT = process.env.PORT || 3005;
@@ -84,9 +85,8 @@ const verifyAdminToken = async (req, res, next) => {
 // Helper function to get IST time in 'YYYY-MM-DD HH:mm:ss' format
 function getISTTimestamp() {
     const now = new Date();
-    // IST is UTC+5:30, so add 5.5 hours in milliseconds
-    const istOffset = 5.5 * 60 * 60 * 1000;
-    const istTime = new Date(now.getTime() + istOffset);
+    // Convert to IST (UTC+5:30) using toLocaleString with Asia/Kolkata
+    const istTime = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
     return istTime.getFullYear() + '-' +
         String(istTime.getMonth() + 1).padStart(2, '0') + '-' +
         String(istTime.getDate()).padStart(2, '0') + ' ' +
@@ -291,7 +291,7 @@ app.post('/api/admin/bookings/:id/confirm', verifyAdminToken, async (req, res) =
         const bookingId = req.params.id;
         console.log('Confirming booking with ID:', bookingId);
 
-        // First, fetch the booking
+        // First, fetch the booking with user and vehicle details
         const { data: booking, error: fetchError } = await supabase
             .from('bookings')
             .select(`
@@ -314,6 +314,19 @@ app.post('/api/admin/bookings/:id/confirm', verifyAdminToken, async (req, res) =
             return res.status(404).json({ error: 'Booking not found' });
         }
 
+        // Get vehicle details
+        let vehicle;
+        if (booking.vehicle_type === 'bike') {
+            const { data } = await supabase.from('bikes').select('*').eq('id', booking.vehicle_id).single();
+            vehicle = data;
+        } else if (booking.vehicle_type === 'car') {
+            const { data } = await supabase.from('cars').select('*').eq('id', booking.vehicle_id).single();
+            vehicle = data;
+        } else if (booking.vehicle_type === 'scooty') {
+            const { data } = await supabase.from('scooty').select('*').eq('id', booking.vehicle_id).single();
+            vehicle = data;
+        }
+
         // Always set confirmation_timestamp to current IST time
         const istTimestamp = getISTTimestamp();
         console.log('Setting confirmation_timestamp to (IST):', istTimestamp); // Debug log
@@ -331,6 +344,44 @@ app.post('/api/admin/bookings/:id/confirm', verifyAdminToken, async (req, res) =
         if (updateError) {
             console.error('Error updating booking:', updateError);
             return res.status(500).json({ error: 'Error updating booking status' });
+        }
+
+        // Send email notification
+        if (booking.users?.email && booking.users?.full_name) {
+            try {
+                const duration = parseInt(booking.duration) || 0;
+                const vehiclePrice = vehicle ? parseFloat(vehicle.price) || 0 : 0;
+                const totalAmount = duration * vehiclePrice;
+                const advancePayment = parseFloat(booking.advance_payment) || 100;
+                const remainingAmount = totalAmount - advancePayment;
+
+                const bookingDetails = {
+                    vehicleName: vehicle ? vehicle.name : 'N/A',
+                    vehicleType: vehicle ? vehicle.type : booking.vehicle_type || 'N/A',
+                    startDate: booking.start_date || 'N/A',
+                    startTime: booking.start_time || 'N/A',
+                    duration: duration,
+                    totalAmount: totalAmount,
+                    advancePayment: advancePayment,
+                    remainingAmount: remainingAmount,
+                    confirmationTime: istTimestamp
+                };
+
+                const emailResult = await sendBookingConfirmationEmail(
+                    booking.users.email,
+                    booking.users.full_name,
+                    bookingDetails
+                );
+
+                if (emailResult.success) {
+                    console.log('Booking confirmation email sent successfully');
+                } else {
+                    console.error('Failed to send booking confirmation email:', emailResult.error);
+                }
+            } catch (emailError) {
+                console.error('Error sending booking confirmation email:', emailError);
+                // Don't fail the booking confirmation if email fails
+            }
         }
 
         res.json(updatedBooking);
@@ -469,22 +520,69 @@ app.post('/api/admin/bookings/:id/reject', verifyAdminToken, async (req, res) =>
 
 // Admin: Mark refund as completed
 app.post('/api/admin/bookings/:id/refund-complete', verifyAdminToken, async (req, res) => {
+    console.log('Received request to mark refund as complete for booking:', req.params.id);
     try {
-        const { data, error } = await supabase
+        const bookingId = parseInt(req.params.id);
+        const adminId = req.user.id;
+
+        // Verify admin status
+        const { data: admin, error: adminError } = await supabase
+            .from('users')
+            .select('is_admin')
+            .eq('id', adminId)
+            .single();
+
+        if (adminError || !admin || !admin.is_admin) {
+            return res.status(403).json({ error: 'Unauthorized access' });
+        }
+
+        // Update the booking refund status with IST timestamp
+        const { data: booking, error: updateError } = await supabase
             .from('bookings')
             .update({
                 refund_status: 'completed',
-                refund_completion_timestamp: new Date().toISOString()
+                refund_timestamp: getISTTimestamp(),
+                refund_completed_by: adminId
             })
-            .eq('id', req.params.id)
-            .select()
+            .eq('id', bookingId)
+            .select('*, users:user_id(email, full_name)')
             .single();
 
-        if (error) throw error;
-        res.json(data);
+        if (updateError) {
+            console.error('Error updating refund status:', updateError);
+            return res.status(500).json({ error: 'Failed to update refund status' });
+        }
+
+        // Log the refund completion
+        await supabase
+            .from('activity_log')
+            .insert({
+                admin_id: adminId,
+                action: 'refund_completed',
+                booking_id: bookingId,
+                details: {
+                    refund_amount: booking.refund_amount,
+                    payment_method: booking.refund_details?.method || 'unknown'
+                }
+            });
+
+        // Send refund completion email to user
+        if (booking.users?.email) {
+            const { sendRefundCompleteEmail } = require('./config/emailService');
+            await sendRefundCompleteEmail(
+                booking.users.email,
+                booking.users.full_name,
+                booking.id,
+                booking.refund_amount,
+                booking.refund_timestamp,
+                booking.refund_details
+            );
+        }
+
+        res.json({ message: 'Refund marked as completed', booking });
     } catch (error) {
-        console.error('Error marking refund as completed:', error);
-        res.status(500).json({ error: 'Error marking refund as completed' });
+        console.error('Error completing refund:', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
@@ -600,61 +698,6 @@ app.post('/api/admin/bookings/:id/cancel', verifyAdminToken, async (req, res) =>
             error: 'Error cancelling booking',
             details: error.message
         });
-    }
-});
-
-// Admin endpoint to mark refund as completed
-app.post('/api/admin/bookings/:id/refund/complete', verifyAdminToken, async (req, res) => {
-    console.log('Received request to mark refund as complete for booking:', req.params.id);
-    try {
-        const bookingId = parseInt(req.params.id);
-        const adminId = req.user.id;
-
-        // Verify admin status
-        const { data: admin, error: adminError } = await supabase
-            .from('users')
-            .select('is_admin')
-            .eq('id', adminId)
-            .single();
-
-        if (adminError || !admin || !admin.is_admin) {
-            return res.status(403).json({ error: 'Unauthorized access' });
-        }
-
-        // Update the booking refund status
-        const { data: booking, error: updateError } = await supabase
-            .from('bookings')
-            .update({
-                refund_status: 'completed',
-                refund_completed_at: new Date().toISOString(),
-                refund_completed_by: adminId
-            })
-            .eq('id', bookingId)
-            .select()
-            .single();
-
-        if (updateError) {
-            console.error('Error updating refund status:', updateError);
-            return res.status(500).json({ error: 'Failed to update refund status' });
-        }
-
-        // Log the refund completion
-        await supabase
-            .from('activity_log')
-            .insert({
-                admin_id: adminId,
-                action: 'refund_completed',
-                booking_id: bookingId,
-                details: {
-                    refund_amount: booking.refund_amount,
-                    payment_method: booking.refund_details?.method || 'unknown'
-                }
-            });
-
-        res.json({ message: 'Refund marked as completed', booking });
-    } catch (error) {
-        console.error('Error completing refund:', error);
-        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
@@ -937,11 +980,19 @@ app.get('/api/dashboard-stats', async (req, res) => {
         const { count: pendingBookings } = await supabase.from('bookings').select('id', { count: 'exact', head: true }).eq('status', 'pending');
         const { count: confirmedBookings } = await supabase.from('bookings').select('id', { count: 'exact', head: true }).eq('status', 'confirmed');
         const { count: cancelledBookings } = await supabase.from('bookings').select('id', { count: 'exact', head: true }).eq('status', 'cancelled');
-        const { count: pendingRefunds } = await supabase.from('bookings').select('id', { count: 'exact', head: true }).eq('status', 'cancelled'); // or use a refund status if you have one
+        const { count: pendingRefunds } = await supabase
+            .from('bookings')
+            .select('id', { count: 'exact', head: true })
+            .in('status', ['cancelled', 'rejected'])
+            .eq('refund_status', 'processing');
 
         // Today's bookings
         const today = new Date().toISOString().split('T')[0];
-        const { count: todaysBookings } = await supabase.from('bookings').select('id', { count: 'exact', head: true }).eq('start_date', today);
+        const { count: todaysBookings } = await supabase
+            .from('bookings')
+            .select('id', { count: 'exact', head: true })
+            .gte('created_at', today + 'T00:00:00')
+            .lt('created_at', today + 'T23:59:59');
 
         res.json({
             totalVehicles,
@@ -1301,6 +1352,143 @@ app.post('/api/bookings/:id/refund-details', verifyToken, async (req, res) => {
     }
 });
 
+// Forgot Password: Request OTP
+app.post('/api/forgot-password', async (req, res) => {
+    try {
+        const { email } = req.body;
+        
+        if (!email) {
+            return res.status(400).json({ error: 'Email is required' });
+        }
+
+        // Check if user exists
+        const { data: user, error: userError } = await supabase
+            .from('users')
+            .select('id, email, full_name')
+            .eq('email', email)
+            .single();
+
+        if (userError || !user) {
+            return res.status(404).json({ error: 'User not found with this email' });
+        }
+
+        // Generate OTP
+        const otp = generateOTP();
+        const otpExpiry = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes from now
+
+        // Store OTP in database (you might want to create a separate table for this)
+        const { error: otpError } = await supabase
+            .from('password_reset_otps')
+            .upsert({
+                user_id: user.id,
+                email: user.email,
+                otp: otp,
+                expires_at: otpExpiry.toISOString(),
+                created_at: new Date().toISOString()
+            });
+
+        if (otpError) {
+            console.error('Error storing OTP:', otpError);
+            return res.status(500).json({ error: 'Error generating OTP' });
+        }
+
+        // Send OTP email
+        const emailResult = await sendPasswordResetOTP(user.email, user.full_name, otp);
+
+        if (emailResult.success) {
+            res.json({ message: 'OTP sent successfully to your email' });
+        } else {
+            console.error('Failed to send OTP email:', emailResult.error);
+            res.status(500).json({ error: 'Failed to send OTP email' });
+        }
+
+    } catch (error) {
+        console.error('Error in forgot password:', error);
+        res.status(500).json({ error: 'Error processing forgot password request' });
+    }
+});
+
+// Forgot Password: Verify OTP and Reset Password
+app.post('/api/reset-password', async (req, res) => {
+    try {
+        const { email, otp, newPassword } = req.body;
+        
+        if (!email || !otp) {
+            return res.status(400).json({ error: 'Email and OTP are required' });
+        }
+
+        // Verify OTP
+        const { data: otpRecord, error: otpError } = await supabase
+            .from('password_reset_otps')
+            .select('*')
+            .eq('email', email)
+            .eq('otp', otp)
+            .gte('expires_at', new Date().toISOString())
+            .single();
+
+        if (otpError || !otpRecord) {
+            return res.status(400).json({ error: 'Invalid or expired OTP' });
+        }
+
+        // If no new password provided, just verify OTP
+        if (!newPassword) {
+            res.json({ message: 'OTP verified successfully' });
+            return;
+        }
+
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+        // Update user password
+        const { error: updateError } = await supabase
+            .from('users')
+            .update({ password: hashedPassword })
+            .eq('id', otpRecord.user_id);
+
+        if (updateError) {
+            console.error('Error updating password:', updateError);
+            return res.status(500).json({ error: 'Error updating password' });
+        }
+
+        // Delete used OTP
+        await supabase
+            .from('password_reset_otps')
+            .delete()
+            .eq('id', otpRecord.id);
+
+        res.json({ message: 'Password reset successfully' });
+
+    } catch (error) {
+        console.error('Error in reset password:', error);
+        res.status(500).json({ error: 'Error resetting password' });
+    }
+});
+
+// Temporary email test endpoint (remove in production)
+app.get('/test-email', async (req, res) => {
+    try {
+        const { sendPasswordResetOTP } = require('./config/emailService');
+        const testEmail = process.env.EMAIL_USER || 'test@example.com';
+        const result = await sendPasswordResetOTP(testEmail, 'Test User', '123456');
+        res.json({
+            success: true,
+            message: 'Email test completed',
+            result: result
+        });
+    } catch (error) {
+        console.error('Email test error:', error);
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            emailConfig: {
+                user: process.env.EMAIL_USER ? 'Set' : 'Not set',
+                pass: process.env.EMAIL_PASS ? 'Set' : 'Not set'
+            }
+        });
+    }
+});
+
 app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Email test endpoint: http://localhost:${PORT}/test-email`);
 }); 
